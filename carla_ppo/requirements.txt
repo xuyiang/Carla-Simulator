@@ -1,0 +1,43 @@
+# ---------------------------------------------------------------
+# Core requirements — install with:
+#   pip install -r requirements.txt
+#
+# Recommended: use the conda environment instead (environment.yml)
+#   conda env create -f environment.yml
+#   conda activate rl-driving
+# ---------------------------------------------------------------
+
+# Scientific computing
+numpy>=1.23
+scipy>=1.9
+pandas>=1.5
+
+# Deep learning (CPU wheel; swap for torch+cu118 etc. for GPU)
+torch>=2.0
+torchvision>=0.15
+
+# Reinforcement learning
+gymnasium>=0.29
+gymnasium[classic-control]
+stable-baselines3>=2.2
+
+# Rendering
+pygame>=2.3
+opencv-python>=4.8
+
+# Logging & visualization
+matplotlib>=3.6
+seaborn>=0.12
+tensorboard>=2.14
+
+# Notebook
+jupyter
+ipykernel
+tqdm
+
+# ---------------------------------------------------------------
+# CARLA (Phase 5 only) — requires CARLA server 0.9.15
+# After installing CARLA, add its .egg to PYTHONPATH or run:
+#   pip install carla==0.9.15
+# See README Phase 5 setup for detailed instructions.
+# ---------------------------------------------------------------

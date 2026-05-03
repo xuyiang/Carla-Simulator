@@ -1,0 +1,42 @@
+name: rl-driving
+channels:
+  - pytorch
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.9
+  - pip
+  # Scientific computing
+  - numpy>=1.23
+  - scipy>=1.9
+  - pandas>=1.5
+  - sympy=1.13.1        # pinned — torch 2.x requires exactly 1.13.1
+  # NOTE: PyTorch is installed via pip (see below) with CUDA 12.1 support
+  # Tested on: NVIDIA RTX 3060 Ti, CUDA 12.1, torch 2.5.1+cu121
+  # Visualization
+  - matplotlib>=3.6
+  - seaborn>=0.12
+  # Gym / Gymnasium
+  - conda-forge::gymnasium>=0.29
+  # Video rendering for environments
+  - conda-forge::pygame>=2.3
+  - conda-forge::opencv>=4.8
+  # Notebook support
+  - jupyter
+  - ipykernel
+  - tqdm
+  - pip:
+    # PyTorch with CUDA 12.1 (RTX 30xx / 40xx series GPU)
+    # For CPU only: pip install torch torchvision
+    # For CUDA 11.8: change cu121 → cu118
+    - --extra-index-url https://download.pytorch.org/whl/cu121
+    - torch==2.5.1+cu121
+    - torchvision==0.20.1+cu121
+    # PPO / DQN convenience library (wraps PyTorch)
+    - stable-baselines3>=2.2
+    # Gymnasium extras
+    - gymnasium[classic-control]
+    # Plotting & logging
+    - tensorboard>=2.14
+    # CARLA Python API (Phase 5)
+    - carla==0.9.15

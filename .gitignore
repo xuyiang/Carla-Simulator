@@ -216,3 +216,21 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# --- CARLA packaged build: carla_ppo/WindowsNoEditor ---
+# Ignore the shipped simulator tree; keep only models/, logs/, and Python scripts at this folder's root.
+# (Explicit Carla folders/exe listed for clarity; bulk of content is covered by the first rule.)
+carla_ppo/WindowsNoEditor/*
+carla_ppo/WindowsNoEditor/CarlaUE4/
+carla_ppo/WindowsNoEditor/CarlaUE4.exe
+carla_ppo/WindowsNoEditor/Co-Simulation/
+carla_ppo/WindowsNoEditor/Engine/
+carla_ppo/WindowsNoEditor/HDMaps/
+carla_ppo/WindowsNoEditor/Plugins/
+carla_ppo/WindowsNoEditor/PythonAPI/
+carla_ppo/WindowsNoEditor/__pycache__/
+!carla_ppo/WindowsNoEditor/models/
+!carla_ppo/WindowsNoEditor/models/**
+!carla_ppo/WindowsNoEditor/logs/
+!carla_ppo/WindowsNoEditor/logs/**
+!carla_ppo/WindowsNoEditor/*.py
