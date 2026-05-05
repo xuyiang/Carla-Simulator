@@ -1,13 +1,56 @@
 # Carla-Simulator
-Autonomous Driving On Carla Simular Based on RL/MPC/PID, the goal of this project is to achieve fully automous driving in Carla.
 
-# Tranning Version:
+Autonomous driving experiments in **CARLA** using RL (PPO), with room for MPC/PID-style control. The aim is stable end-to-end driving behavior in simulation.
 
-## V1:
-I set the simple task of lane keep with out breke contro. So i define the 'action space' with Low[0,-1] High[1,1] with action[0]='Throttle'&Action[1]='steer' in *carla_env.py*. Train will *train_ppo.py*. Using simple reward 'method=velocity * 0.3-lateral_norm * 0.3 if collision=True:-50.0'. I used PPO from stable_baseline3 with training 100K steps(aka decision step). **Note: for V1**,Tranning Step(Decision Step)=Carla Step(action steps). 
-**Result**: Weak Obs+Customize Reward with Fully Rl PPO in **Town02** with **0 NPC**, achieve smooth steer control with some support steer/smooth reward(sharp steer penalty). Actived an smooth **lane following** in Carla.
+---
 
-**V1 in Carla**
-https://www.youtube.com/watch?v=ElbHdQus8k0
+## Stack
 
+| Piece | Choice |
+|--------|--------|
+| Simulator | [CARLA](https://carla.org/) |
+| RL | [Stable-Baselines3](https://stable-baselines3.readthedocs.io/) PPO |
+| Python API | `carla` client + Gym-style env wrapper |
 
+---
+
+## Setup
+
+1. Install and run a CARLA release that matches your client API version.
+2. Create the Python environment from `carla_ppo/`:
+
+   ```bash
+   cd carla_ppo
+   conda env create -f environment.yml
+   conda activate rl-driving
+   ```
+
+   Or with pip: `pip install -r requirements.txt` (see comments in that file for GPU PyTorch).
+
+3. Training scripts live under **`carla_ppo/WindowsNoEditor/`** (e.g. `carla_env.py`, `train_ppo.py`).
+
+---
+
+## Training versions
+
+### V1 — Lane keeping (PPO)
+
+- **Task:** Lane keeping **without** brake control in the action space.
+- **Actions** (`carla_env.py`): `Box(low=[0, -1], high=[1, 1])` — `[throttle, steer]`.
+- **Training:** `train_ppo.py`, **100k** environment steps, PPO from Stable-Baselines3.
+- **Reward (concept):** `0.3 * velocity - 0.3 * lateral_norm`, plus **-50** on collision; extra shaping for smooth steering (penalty on sharp steer).
+- **Note:** In V1, **one RL decision step = one CARLA control step** (no frame-skip between action and sim step).
+
+**Setup:** Town02, **0 NPC** vehicles, relatively simple observations + custom reward, full RL PPO.
+
+**Outcome:** Smooth steering and **lane following** in CARLA; policy learns throttle/steer coordination without explicit brake dimension.
+
+### Demo
+
+[V1 lane following in CARLA — YouTube](https://www.youtube.com/watch?v=ElbHdQus8k0)
+
+---
+
+## License
+
+See [`LICENSE`](LICENSE) in the repository root.
