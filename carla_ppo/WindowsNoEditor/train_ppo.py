@@ -8,7 +8,7 @@ from carla_env import CarlaEnv
 
 # 每次训练用独立 run 名（时间戳 + 阶段标签），避免覆盖旧模型 / 旧 TB 日志
 # 改 STAGE_TAG 区分课程阶段：stage1_lanekeep / stage2_brake_npc / stage3_traffic_light
-STAGE_TAG = "stage2_brake_npc"
+STAGE_TAG = "stage_acc_hybrid_v1"
 RUN_NAME = f"{STAGE_TAG}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
 
 MODELS_DIR = "./models"
@@ -22,7 +22,7 @@ env = CarlaEnv(
     spectator_distance=12.0,
     spectator_height=4.0,
     spectator_pitch=-15.0,
-    
+    num_npcs=20,
 )
 
 model = PPO(
@@ -31,6 +31,7 @@ model = PPO(
     verbose=1,
     tensorboard_log=TB_DIR,
     device="cpu",
+    seed=42
 )
 
 # 每 20k step 存一次中间权重，崩了/想回滚都救得回来

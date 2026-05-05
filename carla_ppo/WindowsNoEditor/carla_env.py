@@ -36,11 +36,11 @@ class CarlaEnv(gym.Env):
         self._spectator_distance = spectator_distance
         self._spectator_height = spectator_height
         self._spectator_pitch = spectator_pitch
-        # 方案 A：第 0 维 long ∈ [-1, 1]，正数→油门，负数→刹车（互斥，物理天然合理）
-        # 第 1 维 steer ∈ [-1, 1]
+        # 路径 A 混合控制：RL 只输出 steer ∈ [-1, 1]
+        # throttle / brake 由内部经典 ACC 控制器 (_compute_acc_control) 计算，不交给网络
         self.action_space = gym.spaces.Box(
-            low=np.array([-1.0, -1.0], dtype=np.float32),
-            high=np.array([ 1.0,  1.0], dtype=np.float32),
+            low=np.array([-1.0], dtype=np.float32),
+            high=np.array([ 1.0], dtype=np.float32),
             dtype=np.float32
         )
         self.observation_space = gym.spaces.Box(
@@ -64,13 +64,16 @@ class CarlaEnv(gym.Env):
         # 相邻两次 RL 决策的转角变化惩罚，抑制左右抽搐
         self.steer_delta_coef = 0.08
 
-        # --- 避障 / 刹车 shaping ---
-        # 距离前方障碍 < safe_d 时开始介入；< danger_d 时全权重
-        self.brake_safe_dist = 12.0
-        self.brake_danger_dist = 5.0
-        # 近障碍仍踩油门 → 大惩罚；近障碍踩刹车 → 小奖励
-        self.throttle_near_obstacle_coef = 1.5
-        self.brake_near_obstacle_coef = 0.5
+        # --- 经典 ACC 控制器参数（内部用，不暴露给 RL）---
+        # Constant-Time-Headway: d_safe = v_ego * tau + d_min
+        # 前车足够远 → 巡航 v_set；d <= d_min → 强刹至 0；中间段线性插值
+        self.acc_v_set = 10.0          # 目标巡航速度 m/s（约 36 km/h，比 NPC 略快）
+        self.acc_tau = 1.5             # 时间间距 s
+        self.acc_d_min = 5.0           # 最小安全距离 m
+        self.acc_kp_throttle = 0.4     # 加速 P 增益
+        self.acc_kp_brake = 0.5        # 减速 P 增益
+        self.acc_max_throttle = 0.7
+        self.acc_lidar_far = 28.0      # lidar_distance >= 此值视为前方空旷
 
         # --- LiDAR OpenCV 俯视可视化（仅调试；训练请 debug_lidar=False）---
         # 原因：CARLA 主窗口不渲染点云；用 OpenCV 把传感器坐标系下的 (x前,y左) 投到 2D 图像上即可实时看障碍物分布。
@@ -85,6 +88,16 @@ class CarlaEnv(gym.Env):
         # 仅缓存最新点云的 (N, 2) xy，由 LiDAR 回调线程写、主线程读 → 主线程做 imshow，
         # 避免 Windows 上 OpenCV 窗口跑在 sensor 线程导致「无响应」。
         self._lidar_latest_pts = None
+
+        # --- 运行时状态的占位默认值（实际值由 _update_state 在每个 step 前刷新）---
+        # 不写也能跑，但写上去 IDE / 静态检查 / 直接调试时更稳
+        self.speed = 0.0
+        self.speed_norm = 0.0
+        self.lateral_norm = 0.0
+        self.sin_h = 0.0
+        self.cos_h = 1.0
+        self.vehicle_location = None
+        self.waypoint = None
 
     def reset(self, seed=None, options=None):
         if self.vehicle is not None:
@@ -179,38 +192,30 @@ class CarlaEnv(gym.Env):
         )
         spectator.set_transform(carla.Transform(loc, rot))
 
-    def step(self,action):
-        # 方案 A：long ∈ [-1, 1]，正→油门，负→刹车，互斥
-        long_cmd = float(action[0])
-        steer    = float(action[1])
-        if long_cmd >= 0.0:
-            throttle = long_cmd
-            brake = 0.0
-        else:
-            throttle = 0.0
-            brake = -long_cmd
-
-        control = carla.VehicleControl(
-            throttle=throttle,
-            steer=steer,
-            brake=brake,
-        )
+    def step(self, action):
+        # 路径 A：RL 只控制 steer，throttle / brake 每个 inner-step 由 ACC 实时计算
+        steer = float(action[0])
 
         total_reward = 0.0
         terminated = False
         truncated = False
-        for _ in range (self.action_repeat):
-
+        last_throttle = 0.0
+        last_brake = 0.0
+        for _ in range(self.action_repeat):
+            # 用最新观测重算 ACC（前车突然减速也能在 50ms 内反应）
+            throttle, brake = self._compute_acc_control()
+            last_throttle, last_brake = throttle, brake
+            control = carla.VehicleControl(
+                throttle=throttle,
+                steer=steer,
+                brake=brake,
+            )
             self.vehicle.apply_control(control)
 
             time.sleep(0.05)
-            #observation前先计数
-            self.step_count+=1
-            #计算调用一遍
+            self.step_count += 1
             self._update_state()
-            #确保我能看到车跟随视角
             self._update_spectator()
-            # 主线程刷 LiDAR BEV 窗口，内部 12fps 限频；debug_lidar=False 时直接 return
             self._pump_lidar_vis()
 
             total_reward += self._physics_reward()
@@ -218,20 +223,20 @@ class CarlaEnv(gym.Env):
             if self.collision_happened:
                 terminated = True
                 break
-            if self.step_count>=self.max_steps:
-                truncated  = True
+            if self.step_count >= self.max_steps:
+                truncated = True
                 break
 
         obs = self._get_observation()
-        # 转角 / 刹车相关惩罚：macro-step 只算一次（repeat 内动作不变）
-        reward = (
-            total_reward
-            + self._steer_shaping_penalty(steer)
-            + self._brake_shaping(long_cmd)
-        )
+        # 路径 A：reward 只关心车道保持；steer shaping 仍保留以抑制方向盘抽搐
+        reward = total_reward + self._steer_shaping_penalty(steer)
         self._prev_steer = steer
-        info = {}
-
+        info = {
+            "speed": float(self.speed),
+            "lidar_d": float(self.lidar_distance),
+            "throttle": last_throttle,
+            "brake": last_brake,
+        }
         return obs, reward, terminated, truncated, info
 
     def close(self):
@@ -289,11 +294,20 @@ class CarlaEnv(gym.Env):
     def _get_observation(self):
         return np.array([self.speed_norm,self.lateral_norm,self.sin_h,self.cos_h,self.lidar_distance/30.0], dtype=np.float32)
     def _physics_reward(self):
-        """每个仿真小步累计：速度 / 横向 / 碰撞。"""
-        reward = self.speed_norm * 0.5
-        reward -= abs(self.lateral_norm) * 0.5
+        """
+        路径 A 的 reward：纵向交给 ACC，RL 只学方向 → 只奖励 RL 能影响的项。
+        每个 inner-step 调用一次，在 step() 的 action_repeat 循环里累加。
+        """
+        # 路径 A：纵向（speed）由 ACC 决定，RL 动作影响不到 → 把 speed reward 全部去掉
+        # RL 只能通过 steer 影响：(1) 横向 lateral_norm；(2) heading；(3) 是否撞车
+        # 所以 reward 只奖励这三项，避免给模型加入它根本没法控制的 noise
+        # lane_keep: lateral_norm ∈ [-1, 1]，正中央=0 → +0.5；贴车道边=±1 → 0
+        lane_keep = (1.0 - abs(self.lateral_norm)) * 0.5
+        # heading: cos_h ≈ 1 表示车头与车道方向一致；反向 → -1
+        heading = self.cos_h * 0.3
+        reward = lane_keep + heading
         if self.collision_happened:
-            reward -= 50.0
+            reward -= 100.0
         return float(reward)
 
     def _steer_shaping_penalty(self, steer_cmd: float) -> float:
@@ -305,22 +319,42 @@ class CarlaEnv(gym.Env):
         smooth = -self.steer_delta_coef * abs(steer_cmd - self._prev_steer)
         return float(low_speed + smooth)
 
-    def _brake_shaping(self, long_cmd: float) -> float:
+    def _compute_acc_control(self):
         """
-        前方近障碍时：踩油门 → 强惩罚；踩刹车 → 弱奖励。
-        距离 >= safe_d 时本项为 0，不影响纯巡航场景的 reward 分布。
+        经典 Constant-Time-Headway ACC 控制器（写死的规则，不参与训练）。
+
+        d_safe = v_ego * tau + d_min
+            d_lead >= acc_lidar_far : 前方空旷 → 巡航 v_set
+            d_lead <= d_min         : 太近 → 强刹至 0
+            否则                    : v_target 在 [0, v_set] 之间按距离线性插值
+
+        然后用 P 控制器把 (v_target - v_ego) 换算成 throttle/brake（互斥）。
+        这样模型只需要专注学方向盘，纵向上自动具备「前车停我停、前车走我走」的 ACC 行为。
         """
-        d = self.lidar_distance
-        if d >= self.brake_safe_dist:
-            return 0.0
-        # proximity ∈ [0, 1]，越近越接近 1
-        denom = max(self.brake_safe_dist - self.brake_danger_dist, 1e-3)
-        proximity = float(np.clip((self.brake_safe_dist - d) / denom, 0.0, 1.0))
-        if long_cmd > 0.0:
-            return -self.throttle_near_obstacle_coef * proximity * long_cmd
+        v_ego = float(self.speed)
+        d_lead = float(self.lidar_distance)
+
+        d_safe = v_ego * self.acc_tau + self.acc_d_min
+
+        if d_lead >= self.acc_lidar_far:
+            v_target = self.acc_v_set
+        elif d_lead <= self.acc_d_min:
+            v_target = 0.0
         else:
-            # long_cmd <= 0 → 刹车强度 = -long_cmd
-            return self.brake_near_obstacle_coef * proximity * (-long_cmd)
+            # 跟车减速段：从 d_min 到 d_safe + 5m 之间线性映射 0 → v_set
+            denom = max(d_safe + 5.0 - self.acc_d_min, 1e-3)
+            ratio = (d_lead - self.acc_d_min) / denom
+            v_target = self.acc_v_set * float(np.clip(ratio, 0.0, 1.0))
+
+        speed_err = v_target - v_ego
+        if speed_err > 0:
+            throttle = float(np.clip(self.acc_kp_throttle * speed_err, 0.0, self.acc_max_throttle))
+            brake = 0.0
+        else:
+            throttle = 0.0
+            brake = float(np.clip(-self.acc_kp_brake * speed_err, 0.0, 1.0))
+        return throttle, brake
+
 
     def _spawn_npcs(self, ego_spawn, spawn_points):
         """在 ego 之外的出生点随机生成 autopilot NPC，离 ego 至少 25 米，避免开局碰撞。"""

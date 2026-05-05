@@ -7,7 +7,7 @@ from carla_env import CarlaEnv
 # 想再换可以试 Town05（路口超多）或 Town04（带高速）
 EVAL_MAP = "Town02"
 EVAL_NPCS = 80
-MODEL_PATH = r".\models\stage2_brake_npc_20260429_031800_final.zip"
+MODEL_PATH = r".\models\stage2_rewardv2_20260503_204159_final.zip"
 
 env = CarlaEnv(
     map_name=EVAL_MAP,
@@ -35,8 +35,10 @@ try:
         ep_steps += 1
 
         print(
-            f"step={i:4d}  ep={episode}  speed={env.speed_norm:.2f}  "
-            f"lateral={env.lateral_norm:.2f}  lidar={env.lidar_distance:5.1f}m  reward={reward:.2f}"
+            f"step={i:4d}  ep={episode}  v={env.speed:5.2f}m/s  "
+            f"lat={env.lateral_norm:+.2f}  d={env.lidar_distance:5.1f}m  "
+            f"thr={info.get('throttle', 0):.2f}  brk={info.get('brake', 0):.2f}  "
+            f"r={reward:+.2f}"
         )
 
         if terminated or truncated:
