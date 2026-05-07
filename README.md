@@ -57,6 +57,9 @@ Autonomous driving experiments in **CARLA** using RL (PPO), with room for MPC/PI
 ![V1 Demo](./carla_ppo/videos/Task%20three%20result.gif)
 ---
 
+### V2 — ACC+PID for Throttle&Brake, RL PPO for Steering
+ 
+
 ## License
 
 See [`LICENSE`](LICENSE) in the repository root.
