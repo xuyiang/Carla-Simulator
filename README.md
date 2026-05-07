@@ -54,7 +54,7 @@ Autonomous driving experiments in **CARLA** using RL (PPO), with room for MPC/PI
 
 
 [V1 lane following in CARLA — YouTube](https://www.youtube.com/watch?v=ElbHdQus8k0)
-
+![V1 Demo](./carla_ppo/videos/Task%20three%20result.gif)
 ---
 
 ## License
