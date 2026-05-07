@@ -59,6 +59,8 @@ Note the main code is located in **"Carla-Simulator/carla_ppo/WindowsNoEditor"**
 ---
 
 ### V2 — ACC+PID for Throttle&Brake, RL PPO for Steering
+
+I am still tunning this model, facing some challenge for throttle and brake control.
  
 
 ## License
