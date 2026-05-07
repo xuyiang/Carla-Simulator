@@ -1,6 +1,7 @@
 # Carla-Simulator
 
 Autonomous driving experiments in **CARLA** using RL (PPO), with room for MPC/PID-style control. The aim is stable end-to-end driving behavior in simulation.
+Note the main code is located in **"Carla-Simulator/carla_ppo/WindowsNoEditor"**
 
 ---
 
