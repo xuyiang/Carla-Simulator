@@ -58,7 +58,7 @@ Note the main code is located in **"Carla-Simulator/carla_ppo/WindowsNoEditor"**
 ![V1 Demo](./carla_ppo/videos/Task%20three%20result.gif)
 ---
 
-### V2 — ACC+PID for Throttle&Brake, RL PPO for Steering
+### V2 — ACC+P"ID" for Throttle&Brake, RL PPO for Steering
 
 I am still tunning this model, facing some challenge for throttle and brake control.
 
@@ -90,6 +90,12 @@ Update direction that i come up:
 2.I checked with openpoilt, I notice lateral_acceletration is more commonly used in observation, because a car park on the side of the lane still provide an non-negative lateral error.
 3. The bottleneck is still low_speed_steer penalty and week lidar, i want replace lidar with semantic lidar that provide by Carla.sensor.lidar.ray_cast_semantic. This will retrive the "Unsigned int containing the semantic tag of the object it." which i can check if this is vehicle. Index: 14,15,16 will be used this case based on Unreal/CarlaUE4/Content/Static
  
+Trainning Note:
+Model converge quicker on land following task compare to previous. But in early steps,because 
+        forward = 0.5 * self.speed_norm * self.cos_h
+        lane_keep = (1.0 - abs(self.lateral_norm)) * 0.4
+The model is satify with driving forward along the path direction, even on the right lane, they already get reward and can run for a while as long as no building the side or NPC come from other side. Model Already can drive stright in 20K-30K global step. Which is more quick compare to V1.
+Potential weakness: lidar_distance was update in 
 
 ## License
 

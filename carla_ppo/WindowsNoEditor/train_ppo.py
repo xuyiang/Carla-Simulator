@@ -45,7 +45,7 @@ checkpoint_cb = CheckpointCallback(
 # KeyboardInterrupt 时额外存一份 interrupted 权重，免得卡在两个 checkpoint 之间白训
 try:
     model.learn(
-        total_timesteps=200_000,
+        total_timesteps=300_000,
         tb_log_name=RUN_NAME,
         callback=checkpoint_cb,
     )

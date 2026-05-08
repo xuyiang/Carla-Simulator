@@ -177,8 +177,8 @@ class CarlaEnv(gym.Env):
         # 路灯杆、墙、栅栏等就不会误触发刹车（这是单通道 LiDAR 又无 tag 的最大痛点）。
         lidar_bp = blueprint_library.find("sensor.lidar.ray_cast_semantic")
         # 参数选自 Velodyne VLP-32 + CARLA 社区惯例（carla-roach / TransFuser）
-        # range 50m：ACC 用 30m 内距离，再多 20m 给前瞻预判和可视化
-        lidar_bp.set_attribute("range", "50")
+        # range 30m：ACC 用 30m 内距离
+        lidar_bp.set_attribute("range", "30")
         # 32 通道是性能/精度甜点；64 不显著提升下游 RL 但 CPU 翻倍
         lidar_bp.set_attribute("channels", "32")
         # FOV +10° / -30°：和真实 Velodyne 一致，下视广覆盖近地，上视看高大障碍
