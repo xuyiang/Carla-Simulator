@@ -16,8 +16,8 @@ class CarlaEnv(gym.Env):
         spectator_height: float = 4.0,
         spectator_pitch: float = -15.0,
         debug_lidar: bool = False,
-        lidar_vis_fps: float = 12.0,
-        lidar_vis_max_points: int = 8000,
+        lidar_vis_fps: float = 20.0,           # 和 LiDAR rotation_frequency 对齐，最丝滑
+        lidar_vis_max_points: int = 30000,     # 600k pts/s ÷ 20Hz = 30k/帧，全显示
         num_npcs: int = 12,
         map_name: str = "Town02",
     ):
@@ -43,8 +43,10 @@ class CarlaEnv(gym.Env):
             high=np.array([ 1.0], dtype=np.float32),
             dtype=np.float32
         )
+        # obs 6 维：speed_norm, lateral_norm, sin_h, cos_h, lidar_d/30, lateral_accel/6
+        # 加了 lateral_accel 让模型能区分「停在路边」和「行驶中跑偏」——前者 a_y=0 后者 a_y 大
         self.observation_space = gym.spaces.Box(
-            low=-1.0, high=1.0, shape=(5,), dtype=np.float32
+            low=-1.0, high=1.0, shape=(6,), dtype=np.float32
         )
         self.vehicle=None
         self.camera=None
@@ -59,10 +61,21 @@ class CarlaEnv(gym.Env):
         self.action_repeat = 4
         # 上一拍 RL 下发的转角，用于平滑惩罚（reset 后初值为 0）
         self._prev_steer = 0.0
-        # 低速时惩罚大方向盘：系数 × |steer| × (1 - speed_norm)，越慢权重越大
-        self.low_speed_steer_coef = 0.25
         # 相邻两次 RL 决策的转角变化惩罚，抑制左右抽搐
         self.steer_delta_coef = 0.08
+
+        # --- Reward 权重 / 终止阈值（路径 A v3 修补：堵 sidewalk / 逆行 / 倒车漏洞）---
+        # forward 用 signed_speed_norm（沿车头方向的速度），倒车自动负分
+        self.forward_coef = 0.7
+        # lane_keep 从「正奖励」改成「penalty」：偏离即扣，越偏越扣
+        self.lane_keep_penalty_coef = 1.0
+        # 在非 Driving 车道（人行道/草地等）每个 inner step 持续扣
+        self.off_road_penalty = 1.0
+        # 逆行（倒车 or 跨黄线到对向车道）惩罚比 off_road 更狠
+        self.wrong_way_penalty = 2.0
+        # 持续越界 N 个 inner step 直接终止 episode（按 0.05s/step 算时间）
+        self.off_road_terminate_steps = 30      # 1.5 秒
+        self.wrong_way_terminate_steps = 20     # 1.0 秒
 
         # --- 经典 ACC 控制器参数（内部用，不暴露给 RL）---
         # Constant-Time-Headway: d_safe = v_ego * tau + d_min
@@ -74,6 +87,10 @@ class CarlaEnv(gym.Env):
         self.acc_kp_brake = 0.5        # 减速 P 增益
         self.acc_max_throttle = 0.7
         self.acc_lidar_far = 28.0      # lidar_distance >= 此值视为前方空旷
+        # v2 反抖动：speed_err 死区 + v_target 一阶低通
+        self.acc_deadband = 0.5        # |v_target - v_ego| < 这个值就 coast，不踩油门也不刹车
+        self.acc_target_alpha = 0.3    # 越小越平滑，但响应越慢；0.3 = 大约 3 拍后跟上目标
+        self._v_target_filt = self.acc_v_set
 
         # --- LiDAR OpenCV 俯视可视化（仅调试；训练请 debug_lidar=False）---
         # 原因：CARLA 主窗口不渲染点云；用 OpenCV 把传感器坐标系下的 (x前,y左) 投到 2D 图像上即可实时看障碍物分布。
@@ -81,23 +98,43 @@ class CarlaEnv(gym.Env):
         self._lidar_vis_dt = 1.0 / max(lidar_vis_fps, 1e-3)
         self._lidar_vis_last_t = 0.0
         self._lidar_vis_max_points = int(lidar_vis_max_points)
-        self._lidar_bev_w = 480
-        self._lidar_bev_h = 480
-        self._lidar_bev_scale = 14.0  # 像素/米，越大视野越「_zoom in」
+        self._lidar_bev_w = 600
+        self._lidar_bev_h = 600
+        # 像素/米：6 px/m × 600 px ≈ ±50m 视野，正好覆盖 lidar range
+        # 之前 14 px/m 只能看到 ±17m，远处车都被裁掉了
+        self._lidar_bev_scale = 6.0
         self._lidar_cv_window_ready = False
         # 仅缓存最新点云的 (N, 2) xy，由 LiDAR 回调线程写、主线程读 → 主线程做 imshow，
         # 避免 Windows 上 OpenCV 窗口跑在 sensor 线程导致「无响应」。
         self._lidar_latest_pts = None
+        self._lidar_latest_tags = None
+        # CARLA 语义标签里被认为是「ACC 目标」的：14=Car / 15=Truck / 16=Bus / 18=Motorcycle / 19=Bicycle
+        # 行人 / Rider 没加进来；如果想让 ACC 也对行人刹车，把 12, 13 加上去
+        self._lidar_dyn_tags = np.array([14, 15, 16, 18, 19], dtype=np.uint32)
 
         # --- 运行时状态的占位默认值（实际值由 _update_state 在每个 step 前刷新）---
         # 不写也能跑，但写上去 IDE / 静态检查 / 直接调试时更稳
         self.speed = 0.0
         self.speed_norm = 0.0
+        self.signed_speed = 0.0       # 沿车头方向的速度，倒车为负
+        self.signed_speed_norm = 0.0  # 归一化到 [-1, 1]，给 obs / forward reward 用
         self.lateral_norm = 0.0
         self.sin_h = 0.0
         self.cos_h = 1.0
+        self.yaw_rate = 0.0
+        self.lateral_accel = 0.0
         self.vehicle_location = None
         self.waypoint = None
+        # 越界 / 逆行检测的瞬时标志 + 持续步数（用于提前终止）
+        self.off_road = False
+        self.actual_lane_type = None
+        self.wrong_way = False
+        self.off_road_steps = 0
+        self.wrong_way_steps = 0
+        # wrong_way Type B 检测的「参考」lane_id / road_id：
+        # 进入新 road 时如果状态合法会被重新锚定，避免跨路口后误判
+        self._ref_lane_id = None
+        self._ref_road_id = None
 
     def reset(self, seed=None, options=None):
         if self.vehicle is not None:
@@ -135,11 +172,23 @@ class CarlaEnv(gym.Env):
         self.latest_image = None
         self.camera.listen(lambda img: setattr(self, 'latest_image', img))
 
-        lidar_bp = blueprint_library.find("sensor.lidar.ray_cast")
-        lidar_bp.set_attribute("range", "30")            # 探测距离 30 米
-        lidar_bp.set_attribute("points_per_second", "10000")  # 每秒点数
-        lidar_bp.set_attribute("channels", "1")          # 只用一层（水平扫描），省资源
-        lidar_bp.set_attribute("rotation_frequency", "20") 
+        # 升级到 ray_cast_semantic：每个点除 (x,y,z) 外还带 (cos_inc_angle, obj_idx, obj_tag)
+        # 这样可以在回调里按 semantic tag 过滤，只把「车辆」当作 ACC 跟车目标，
+        # 路灯杆、墙、栅栏等就不会误触发刹车（这是单通道 LiDAR 又无 tag 的最大痛点）。
+        lidar_bp = blueprint_library.find("sensor.lidar.ray_cast_semantic")
+        # 参数选自 Velodyne VLP-32 + CARLA 社区惯例（carla-roach / TransFuser）
+        # range 50m：ACC 用 30m 内距离，再多 20m 给前瞻预判和可视化
+        lidar_bp.set_attribute("range", "50")
+        # 32 通道是性能/精度甜点；64 不显著提升下游 RL 但 CPU 翻倍
+        lidar_bp.set_attribute("channels", "32")
+        # FOV +10° / -30°：和真实 Velodyne 一致，下视广覆盖近地，上视看高大障碍
+        lidar_bp.set_attribute("upper_fov", "10")
+        lidar_bp.set_attribute("lower_fov", "-30")
+        # 600k pts/s @ 20Hz = 30k 点 / 圈 / 32 通道 ≈ 0.4° 角分辨率（之前 2.3° 太稀）
+        # 30m 处相邻点间距 ≈ 21 cm，一辆车能稳定打到 8~10 个点
+        lidar_bp.set_attribute("points_per_second", "600000")
+        # 20Hz 比真车快（真车 10Hz），仿真里方便 ACC 快速反应
+        lidar_bp.set_attribute("rotation_frequency", "20")
 
         lidar_transformation = carla.Transform(
             carla.Location(z=2.5)
@@ -165,8 +214,20 @@ class CarlaEnv(gym.Env):
         time.sleep(1.0)
         self.step_count = 0
         self._prev_steer = 0.0
+        # ACC 低通滤波器在每个 episode 开头重置回巡航速度，避免上 episode 的余值灌进来
+        self._v_target_filt = self.acc_v_set
+        # 越界 / 逆行计数器在 episode 开头清零
+        self.off_road_steps = 0
+        self.wrong_way_steps = 0
+        # 先把 _ref_lane_id 置 None，让 _update_state 第一次跑时跳过 wrong_way 比较
+        self._ref_lane_id = None
+        self._ref_road_id = None
 
         self._update_state()
+        # 用第一帧的 waypoint 作为「合法初始车道」锚点（spawn point 一定在 Driving 上）
+        self._ref_lane_id = self.waypoint.lane_id
+        self._ref_road_id = self.waypoint.road_id
+
         self._update_spectator()
         obs = self._get_observation()
         return obs, {}
@@ -218,10 +279,24 @@ class CarlaEnv(gym.Env):
             self._update_spectator()
             self._pump_lidar_vis()
 
+            # 越界 / 逆行的「持续步数」累加（一旦回到合法状态立即清零）
+            self.off_road_steps = self.off_road_steps + 1 if self.off_road else 0
+            self.wrong_way_steps = self.wrong_way_steps + 1 if self.wrong_way else 0
+
             total_reward += self._physics_reward()
 
             if self.collision_happened:
                 terminated = True
+                break
+            if self.off_road_steps >= self.off_road_terminate_steps:
+                # 持续越界过久 → 提前终止 + 一次性大惩罚
+                # 这样 PPO 不会让 agent 在人行道上「跑完整个 episode 慢慢回血」
+                terminated = True
+                total_reward -= 50.0
+                break
+            if self.wrong_way_steps >= self.wrong_way_terminate_steps:
+                terminated = True
+                total_reward -= 50.0
                 break
             if self.step_count >= self.max_steps:
                 truncated = True
@@ -233,9 +308,13 @@ class CarlaEnv(gym.Env):
         self._prev_steer = steer
         info = {
             "speed": float(self.speed),
+            "signed_speed": float(self.signed_speed),
             "lidar_d": float(self.lidar_distance),
             "throttle": last_throttle,
             "brake": last_brake,
+            "off_road": bool(self.off_road),
+            "wrong_way": bool(self.wrong_way),
+            "lane_type": str(self.actual_lane_type) if self.actual_lane_type else "None",
         }
         return obs, reward, terminated, truncated, info
 
@@ -291,68 +370,162 @@ class CarlaEnv(gym.Env):
         self.sin_h = math.sin(heading_error)
         self.cos_h = math.cos(heading_error)
 
+        # 横向加速度 a_y = v * yaw_rate（CARLA angular_velocity 单位为 deg/s，转 rad/s）
+        # 用途：(1) reward 里加舒适性惩罚 → 抑制「高速猛打方向」
+        #       (2) 加进 obs → 模型能感知自己产生的离心力
+        # 注意：和 lateral_norm 不重合 —— 停在路边的车 lateral_norm 大但 a_y=0；
+        #              开 50 km/h 急转弯的车 lateral_norm 可能很小但 a_y 爆表。
+        ang = self.vehicle.get_angular_velocity()
+        self.yaw_rate = math.radians(ang.z)
+        self.lateral_accel = float(self.speed * self.yaw_rate)
+
+        # === 沿车头方向的速度（egocentric forward velocity）===
+        # 关键：不依赖任何车道信息，纯靠 vehicle 自己的 transform。
+        # 倒车时这个值是负的 → forward reward 自动负分，不需要额外检测。
+        fwd = self.vehicle.get_transform().get_forward_vector()
+        self.signed_speed = float(vel.x * fwd.x + vel.y * fwd.y)
+        self.signed_speed_norm = float(np.clip(self.signed_speed / self.max_speed, -1.0, 1.0))
+
+        # === Off-road 检测：是不是在 Driving 车道上 ===
+        # project_to_road=False 让这次查询不投影 → 真实反映「车下面是什么 lane」
+        # lane_type=Any 让 sidewalk / shoulder / parking 这些都能被检测到
+        actual_wpt = self.world.get_map().get_waypoint(
+            self.vehicle_location,
+            project_to_road=False,
+            lane_type=carla.LaneType.Any,
+        )
+        if actual_wpt is None:
+            # 完全脱离 OpenDRIVE 元素（草地、地图边界外等）
+            self.off_road = True
+            self.actual_lane_type = None
+        else:
+            self.off_road = (actual_wpt.lane_type != carla.LaneType.Driving)
+            self.actual_lane_type = actual_wpt.lane_type
+
+        # === Wrong-way 检测：两类逆行 ===
+        # Type A: 速度方向 vs 当前最近车道 forward 反向（倒车 / 跑反方向）
+        v_horiz = math.hypot(vel.x, vel.y)
+        if v_horiz > 0.5:
+            lane_fwd = self.waypoint.transform.get_forward_vector()
+            cos_v_lane = (vel.x * lane_fwd.x + vel.y * lane_fwd.y) / v_horiz
+            type_a_wrong = (cos_v_lane < -0.3)
+        else:
+            type_a_wrong = False
+
+        # Type B: 同 road 内 lane_id 符号反转（跨过中线到对向车道）
+        # 注：lane_id 符号约定是「相对 road 参考线左右」，所以同 road 内符号反 = 跨中线
+        # 不同 road 时不能直接比，需要在合法过渡时重新锚定 _ref_*
+        if self._ref_lane_id is None:
+            type_b_wrong = False
+        elif self.waypoint.road_id == self._ref_road_id:
+            type_b_wrong = (
+                np.sign(self.waypoint.lane_id) != np.sign(self._ref_lane_id)
+            )
+        else:
+            # 进入新 road：如果当前看着合法（没逆行也没越界），把这条新路当作新参考
+            type_b_wrong = False
+            if not type_a_wrong and not self.off_road:
+                self._ref_road_id = self.waypoint.road_id
+                self._ref_lane_id = self.waypoint.lane_id
+
+        self.wrong_way = type_a_wrong or type_b_wrong
+
     def _get_observation(self):
-        return np.array([self.speed_norm,self.lateral_norm,self.sin_h,self.cos_h,self.lidar_distance/30.0], dtype=np.float32)
+        # 6 m/s² 是「能感受到」的横向加速度量级；超过的极端值被 clip 成 ±1
+        lat_acc_norm = float(np.clip(self.lateral_accel / 6.0, -1.0, 1.0))
+        # 第 0 维：signed_speed_norm（不是 speed_norm）→ 倒车时为负，模型直接看到方向
+        return np.array([
+            self.signed_speed_norm,
+            self.lateral_norm,
+            self.sin_h,
+            self.cos_h,
+            self.lidar_distance / 30.0,
+            lat_acc_norm,
+        ], dtype=np.float32)
     def _physics_reward(self):
         """
-        路径 A 的 reward：纵向交给 ACC，RL 只学方向 → 只奖励 RL 能影响的项。
-        每个 inner-step 调用一次，在 step() 的 action_repeat 循环里累加。
+        路径 A v3 的 reward：堵 v2 的三个漏洞（人行道拿分 / 逆向拿分 / 倒车拿分）。
+
+        v2 漏洞：
+        (1) lane_keep 是正奖励 + lateral_norm clip 到 ±1 → 人行道也能拿 0；
+        (2) cos_h 比的是「最近车道 forward」，对向车道按其 forward 同向开 → cos_h=+1；
+        (3) forward 用 speed_norm * cos_h，speed_norm 永远 ≥ 0 → 倒车 cos_h 也可能 ≈ +1。
+
+        v3 修复：
+        (1) lane_keep 改成 penalty：-|lateral_norm| * coef，越偏越扣；
+        (2) 加 off_road penalty（_update_state 里用 project_to_road=False 检测）；
+        (3) 加 wrong_way penalty（Type A: 速度反向；Type B: 跨黄线 lane_id 符号反转）；
+        (4) forward 改用 signed_speed_norm（沿车头方向的速度）→ 倒车自动负分。
         """
-        # 路径 A：纵向（speed）由 ACC 决定，RL 动作影响不到 → 把 speed reward 全部去掉
-        # RL 只能通过 steer 影响：(1) 横向 lateral_norm；(2) heading；(3) 是否撞车
-        # 所以 reward 只奖励这三项，避免给模型加入它根本没法控制的 noise
-        # lane_keep: lateral_norm ∈ [-1, 1]，正中央=0 → +0.5；贴车道边=±1 → 0
-        lane_keep = (1.0 - abs(self.lateral_norm)) * 0.5
-        # heading: cos_h ≈ 1 表示车头与车道方向一致；反向 → -1
-        heading = self.cos_h * 0.3
-        reward = lane_keep + heading
+        # 主奖励：沿车头方向开多快。倒车 → 负，正常前进 → 正。最大 ±forward_coef。
+        forward = self.forward_coef * self.signed_speed_norm
+        # 车道居中：永远 ≤ 0；贴中心 0，贴车道边 -coef
+        lane_keep = -self.lane_keep_penalty_coef * abs(self.lateral_norm)
+        # 越界：脚下不是 Driving lane（人行道 / 草地 / 应急道等）
+        off_road_p = -self.off_road_penalty if self.off_road else 0.0
+        # 逆行：倒车 / 跨黄线到对向
+        wrong_way_p = -self.wrong_way_penalty if self.wrong_way else 0.0
+        # 舒适性：横向加速度二次惩罚（a_y=2 → -0.1；a_y=6 → -0.9）
+        lat_acc_n = self.lateral_accel / 2.0
+        comfort = -0.1 * (lat_acc_n ** 2)
+
+        reward = forward + lane_keep + off_road_p + wrong_way_p + comfort
         if self.collision_happened:
             reward -= 100.0
         return float(reward)
 
     def _steer_shaping_penalty(self, steer_cmd: float) -> float:
         """
-        每条 RL 决策一次：低速打方向惩罚 + 与上一拍转角的平滑惩罚。
-        返回加到 total_reward 上的增量（通常为负）。
+        v1 里有 low_speed_steer 项（车慢就罚打方向）—— ACC 上线后这项变成 bug：
+        如果 ACC 因为 lidar 误检而把车刹停，模型反而被惩罚去打方向修正，
+        于是「停下不动 + 不打方向」成了局部最优。这里直接删掉。
+        现在只剩抖方向盘惩罚（jerk 代理），抑制左右抽搐。
+        横向加速度的「猛打方向」惩罚已经移到 _physics_reward 里的 comfort 项。
         """
-        low_speed = -self.low_speed_steer_coef * abs(steer_cmd) * (1.0 - self.speed_norm)
         smooth = -self.steer_delta_coef * abs(steer_cmd - self._prev_steer)
-        return float(low_speed + smooth)
+        return float(smooth)
 
     def _compute_acc_control(self):
         """
-        经典 Constant-Time-Headway ACC 控制器（写死的规则，不参与训练）。
-
-        d_safe = v_ego * tau + d_min
-            d_lead >= acc_lidar_far : 前方空旷 → 巡航 v_set
-            d_lead <= d_min         : 太近 → 强刹至 0
-            否则                    : v_target 在 [0, v_set] 之间按距离线性插值
-
-        然后用 P 控制器把 (v_target - v_ego) 换算成 throttle/brake（互斥）。
-        这样模型只需要专注学方向盘，纵向上自动具备「前车停我停、前车走我走」的 ACC 行为。
+        ACC 控制器 v2：解决 v1 的 3 个老问题：
+        (1) 平滑区间宽度跟 v_ego 挂钩 → 低速时 1m 距离变化 = 2 m/s v_target 跳变
+            修复：直接用固定的 [d_min, lidar_far] = [5, 28] 这段 23m 做线性插值，
+                  1m 距离变化只引起 0.43 m/s v_target 变化。
+        (2) 油门/刹车硬切换（speed_err 过零就翻转）→ 零附近反复抖
+            修复：deadband = 0.5 m/s，|speed_err| 小于这个就既不油门也不刹车（coast）。
+        (3) lidar 自身瞬时抖动直接灌进 v_target → 控制曲线锯齿
+            修复：v_target 一阶低通滤波，平滑系数 alpha=0.3。
         """
         v_ego = float(self.speed)
         d_lead = float(self.lidar_distance)
 
-        d_safe = v_ego * self.acc_tau + self.acc_d_min
-
         if d_lead >= self.acc_lidar_far:
-            v_target = self.acc_v_set
+            v_target_raw = self.acc_v_set
         elif d_lead <= self.acc_d_min:
-            v_target = 0.0
+            v_target_raw = 0.0
         else:
-            # 跟车减速段：从 d_min 到 d_safe + 5m 之间线性映射 0 → v_set
-            denom = max(d_safe + 5.0 - self.acc_d_min, 1e-3)
+            denom = max(self.acc_lidar_far - self.acc_d_min, 1e-3)
             ratio = (d_lead - self.acc_d_min) / denom
-            v_target = self.acc_v_set * float(np.clip(ratio, 0.0, 1.0))
+            v_target_raw = self.acc_v_set * float(np.clip(ratio, 0.0, 1.0))
+
+        # 一阶低通：吃掉 lidar 抖动；reset 时 _v_target_filt 会被置回 acc_v_set
+        self._v_target_filt = (
+            (1.0 - self.acc_target_alpha) * self._v_target_filt
+            + self.acc_target_alpha * v_target_raw
+        )
+        v_target = self._v_target_filt
 
         speed_err = v_target - v_ego
-        if speed_err > 0:
+        if speed_err > self.acc_deadband:
             throttle = float(np.clip(self.acc_kp_throttle * speed_err, 0.0, self.acc_max_throttle))
             brake = 0.0
-        else:
+        elif speed_err < -self.acc_deadband:
             throttle = 0.0
             brake = float(np.clip(-self.acc_kp_brake * speed_err, 0.0, 1.0))
+        else:
+            # deadband 区：滑行，避免油门刹车反复切换
+            throttle = 0.0
+            brake = 0.0
         return throttle, brake
 
 
@@ -478,16 +651,33 @@ class CarlaEnv(gym.Env):
     def _on_lidar(self, data):
         # 此回调跑在 CARLA sensor 工作线程里。绝对不要在这里调 cv2.imshow / waitKey，
         # 否则窗口的 Win32 消息泵不在主线程会被系统判为「无响应」。
-        points = np.frombuffer(data.raw_data, dtype=np.float32).reshape(-1, 4)
-        if self.debug_lidar and points.shape[0] > 0:
-            self._lidar_latest_pts = points[:, :2].copy()
+        #
+        # ray_cast_semantic 每个点 = (x, y, z, cos_inc_angle, obj_idx, obj_tag)
+        # 4 × float32 + 2 × uint32 = 24 字节；用结构化 dtype 一次性解析。
+        # 为什么要 tag 过滤：原来 ray_cast 单通道扫到任何障碍（路灯/墙/栅栏）都
+        # 会缩小 lidar_distance → ACC 误刹车。现在只对 DYNAMIC_TAGS 里的物体
+        # 计算「跟车距离」，路边静态物完全不影响 ACC。
+        dt = np.dtype([
+            ("x", np.float32), ("y", np.float32), ("z", np.float32),
+            ("cos_inc", np.float32),
+            ("idx", np.uint32), ("tag", np.uint32),
+        ])
+        pts = np.frombuffer(data.raw_data, dtype=dt)
 
-        front = points[
-            (points[:, 0] > 0) & (np.abs(points[:, 1]) < points[:, 0] * 0.577)
-        ]
-        if len(front) > 0:
-            distance = np.sqrt(front[:, 0] ** 2 + front[:, 1] ** 2)
-            self.lidar_distance = float(np.min(distance))
+        if self.debug_lidar and pts.shape[0] > 0:
+            self._lidar_latest_pts = np.stack([pts["x"], pts["y"]], axis=1).astype(np.float32)
+            self._lidar_latest_tags = pts["tag"].copy()
+
+        # CARLA 0.9.12+ 语义标签：14=Car, 15=Truck, 16=Bus, 18=Motorcycle, 19=Bicycle
+        # 12=Pedestrian / 13=Rider 也可以加进来当 ACC 目标（更安全），按需打开
+        x = pts["x"]; y = pts["y"]; tag = pts["tag"]
+        # 前向 60° 锥（|y| < x * tan(30°) ≈ 0.577*x），剔除地面附近 z < -1.5（车顶高度约 z=0）
+        cone = (x > 0.5) & (np.abs(y) < x * 0.577) & (pts["z"] > -1.5)
+        is_vehicle = np.isin(tag, self._lidar_dyn_tags)
+        front = cone & is_vehicle
+        if np.any(front):
+            d = np.sqrt(x[front] ** 2 + y[front] ** 2)
+            self.lidar_distance = float(np.min(d))
         else:
             self.lidar_distance = 30.0
 
