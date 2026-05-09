@@ -95,7 +95,7 @@ Model converge quicker on land following task compare to previous. But in early 
         forward = 0.5 * self.speed_norm * self.cos_h
         lane_keep = (1.0 - abs(self.lateral_norm)) * 0.4
 The model is satify with driving forward along the path direction, even on the right lane, they already get reward and can run for a while as long as no building the side or NPC come from other side. Model Already can drive stright in 20K-30K global step. Which is more quick compare to V1.
-Potential weakness: lidar_distance was update in 
+Potential weakness: lidar_distance was update based on frequnecy, raw lidar 
 
 ## License
 
