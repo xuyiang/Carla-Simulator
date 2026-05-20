@@ -97,6 +97,28 @@ Model converge quicker on land following task compare to previous. But in early 
 The model is satify with driving forward along the path direction, even on the right lane, they already get reward and can run for a while as long as no building the side or NPC come from other side. Model Already can drive stright in 20K-30K global step. Which is more quick compare to V1.
 Potential weakness: lidar_distance was update based on frequnecy, raw lidar 
 
+5.20 Finally back from Final:
+
+New noticed: 
+
+Action Repeat is benefit for most case, but my action repeat is 50ms/time.sleep(0.05),this lead to 2m/s per second without any control can be apply to vehicle if we going full speed, which make super hard to turn at high speed.
+Another thing i found and fixed that model stucked in local min due to lack of offroad/wrong way observation, which make the penalty looks super "BlackBox" form model perspective.
+我觉得action repeat在carla simulator中的车速是有一个最优的方法论的，别的rl的思路有用但是hyperparametr应该不一样，需要根据车速来设计
+
+### V4 stage 4(remove action_repeat)
+
+5.20 Trainning
+先读一下相关的paper
+reading: https://arxiv.org/abs/1609.05140
+
+
+
+
+
+
+
+
+
 ## License
 
 See [`LICENSE`](LICENSE) in the repository root.

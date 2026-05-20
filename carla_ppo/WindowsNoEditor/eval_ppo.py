@@ -7,7 +7,7 @@ from carla_env import CarlaEnv
 # 想再换可以试 Town05（路口超多）或 Town04（带高速）
 EVAL_MAP = "Town02"
 EVAL_NPCS = 80
-MODEL_PATH = r".\models\stage_acc_hybrid_v1_20260505_012450_final.zip"
+MODEL_PATH = r".\models\stage_acc_hybrid_v3_20260507_211743_final.zip"
 
 env = CarlaEnv(
     map_name=EVAL_MAP,
@@ -28,7 +28,7 @@ ep_steps = 0
 collisions = 0
 
 try:
-    for i in range(300):
+    for i in range(500):
         action, _ = model.predict(obs, deterministic=True)
         obs, reward, terminated, truncated, info = env.step(action)
         ep_reward += reward

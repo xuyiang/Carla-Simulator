@@ -8,7 +8,7 @@ from carla_env import CarlaEnv
 
 # 每次训练用独立 run 名（时间戳 + 阶段标签），避免覆盖旧模型 / 旧 TB 日志
 # 改 STAGE_TAG 区分课程阶段：stage1_lanekeep / stage2_brake_npc / stage3_traffic_light
-STAGE_TAG = "stage_acc_hybrid_v3"
+STAGE_TAG = "stage_acc_hybrid_v4"
 RUN_NAME = f"{STAGE_TAG}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
 
 MODELS_DIR = "./models"

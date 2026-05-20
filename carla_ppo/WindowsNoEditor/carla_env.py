@@ -43,10 +43,11 @@ class CarlaEnv(gym.Env):
             high=np.array([ 1.0], dtype=np.float32),
             dtype=np.float32
         )
-        # obs 6 维：speed_norm, lateral_norm, sin_h, cos_h, lidar_d/30, lateral_accel/6
-        # 加了 lateral_accel 让模型能区分「停在路边」和「行驶中跑偏」——前者 a_y=0 后者 a_y 大
+        # obs 8 维：signed_speed_norm, lateral_norm, sin_h, cos_h, lidar_d/30, lateral_accel/6,
+        #             off_road (0/1), wrong_way (0/1)
+        # off_road / wrong_way 作为 0/1 信号加入观测 → 模型知道「自己正在被扣 penalty」，能建立因果联系
         self.observation_space = gym.spaces.Box(
-            low=-1.0, high=1.0, shape=(6,), dtype=np.float32
+            low=-1.0, high=1.0, shape=(8,), dtype=np.float32
         )
         self.vehicle=None
         self.camera=None
@@ -57,8 +58,7 @@ class CarlaEnv(gym.Env):
         self.max_speed=15.0
         self.max_steps = 1000
         self.step_count = 0
-        #调参优化reward
-        self.action_repeat = 4
+        # 每个 step_count 是一个 RL 决策步（50ms 物理）
         # 上一拍 RL 下发的转角，用于平滑惩罚（reset 后初值为 0）
         self._prev_steer = 0.0
         # 相邻两次 RL 决策的转角变化惩罚，抑制左右抽搐
@@ -67,8 +67,9 @@ class CarlaEnv(gym.Env):
         # --- Reward 权重 / 终止阈值（路径 A v3 修补：堵 sidewalk / 逆行 / 倒车漏洞）---
         # forward 用 signed_speed_norm（沿车头方向的速度），倒车自动负分
         self.forward_coef = 0.7
-        # lane_keep 从「正奖励」改成「penalty」：偏离即扣，越偏越扣
-        self.lane_keep_penalty_coef = 1.0
+        # lane_keep 正向奖励：完美居中拿 +lane_keep_coef，贴边衰减到 0
+        #        越界由 off_road penalty / 终止单独处理，lane_keep 不再叠惩罚
+        self.lane_keep_coef = 0.5
         # 在非 Driving 车道（人行道/草地等）每个 inner step 持续扣
         self.off_road_penalty = 1.0
         # 逆行（倒车 or 跨黄线到对向车道）惩罚比 off_road 更狠
@@ -254,64 +255,49 @@ class CarlaEnv(gym.Env):
         spectator.set_transform(carla.Transform(loc, rot))
 
     def step(self, action):
-        # 路径 A：RL 只控制 steer，throttle / brake 每个 inner-step 由 ACC 实时计算
         steer = float(action[0])
 
-        total_reward = 0.0
+        throttle, brake = self._compute_acc_control()
+        control = carla.VehicleControl(
+            throttle=throttle,
+            steer=steer,
+            brake=brake,
+        )
+        self.vehicle.apply_control(control)
+
+        time.sleep(0.05)
+        self.step_count += 1
+        self._update_state()
+        self._update_spectator()
+        self._pump_lidar_vis()
+
+        self.off_road_steps = self.off_road_steps + 1 if self.off_road else 0
+        self.wrong_way_steps = self.wrong_way_steps + 1 if self.wrong_way else 0
+
+        reward = self._physics_reward()
         terminated = False
         truncated = False
-        last_throttle = 0.0
-        last_brake = 0.0
-        for _ in range(self.action_repeat):
-            # 用最新观测重算 ACC（前车突然减速也能在 50ms 内反应）
-            throttle, brake = self._compute_acc_control()
-            last_throttle, last_brake = throttle, brake
-            control = carla.VehicleControl(
-                throttle=throttle,
-                steer=steer,
-                brake=brake,
-            )
-            self.vehicle.apply_control(control)
 
-            time.sleep(0.05)
-            self.step_count += 1
-            self._update_state()
-            self._update_spectator()
-            self._pump_lidar_vis()
-
-            # 越界 / 逆行的「持续步数」累加（一旦回到合法状态立即清零）
-            self.off_road_steps = self.off_road_steps + 1 if self.off_road else 0
-            self.wrong_way_steps = self.wrong_way_steps + 1 if self.wrong_way else 0
-
-            total_reward += self._physics_reward()
-
-            if self.collision_happened:
-                terminated = True
-                break
-            if self.off_road_steps >= self.off_road_terminate_steps:
-                # 持续越界过久 → 提前终止 + 一次性大惩罚
-                # 这样 PPO 不会让 agent 在人行道上「跑完整个 episode 慢慢回血」
-                terminated = True
-                total_reward -= 50.0
-                break
-            if self.wrong_way_steps >= self.wrong_way_terminate_steps:
-                terminated = True
-                total_reward -= 50.0
-                break
-            if self.step_count >= self.max_steps:
-                truncated = True
-                break
+        if self.collision_happened:
+            terminated = True
+        elif self.off_road_steps >= self.off_road_terminate_steps:
+            terminated = True
+            reward -= 50.0
+        elif self.wrong_way_steps >= self.wrong_way_terminate_steps:
+            terminated = True
+            reward -= 50.0
+        elif self.step_count >= self.max_steps:
+            truncated = True
 
         obs = self._get_observation()
-        # 路径 A：reward 只关心车道保持；steer shaping 仍保留以抑制方向盘抽搐
-        reward = total_reward + self._steer_shaping_penalty(steer)
+        reward = reward + self._steer_shaping_penalty(steer)
         self._prev_steer = steer
         info = {
             "speed": float(self.speed),
             "signed_speed": float(self.signed_speed),
             "lidar_d": float(self.lidar_distance),
-            "throttle": last_throttle,
-            "brake": last_brake,
+            "throttle": throttle,
+            "brake": brake,
             "off_road": bool(self.off_road),
             "wrong_way": bool(self.wrong_way),
             "lane_type": str(self.actual_lane_type) if self.actual_lane_type else "None",
@@ -431,41 +417,34 @@ class CarlaEnv(gym.Env):
         self.wrong_way = type_a_wrong or type_b_wrong
 
     def _get_observation(self):
-        # 6 m/s² 是「能感受到」的横向加速度量级；超过的极端值被 clip 成 ±1
-        lat_acc_norm = float(np.clip(self.lateral_accel / 6.0, -1.0, 1.0))
-        # 第 0 维：signed_speed_norm（不是 speed_norm）→ 倒车时为负，模型直接看到方向
+        acc_norm = float(np.clip(self.lateral_accel / 6.0, -1.0, 1.0))
+        off_road_val = 1.0 if self.off_road else 0.0
+        wrong_way_val = 1.0 if self.wrong_way else 0.0
         return np.array([
             self.signed_speed_norm,
             self.lateral_norm,
             self.sin_h,
             self.cos_h,
             self.lidar_distance / 30.0,
-            lat_acc_norm,
+            acc_norm,
+            off_road_val,
+            wrong_way_val,
         ], dtype=np.float32)
     def _physics_reward(self):
         """
-        路径 A v3 的 reward：堵 v2 的三个漏洞（人行道拿分 / 逆向拿分 / 倒车拿分）。
+        v4 reward：解决 v3 「观察盲区 + 纯惩罚 lane_keep + action_repeat 信用分配模糊」问题。
 
-        v2 漏洞：
-        (1) lane_keep 是正奖励 + lateral_norm clip 到 ±1 → 人行道也能拿 0；
-        (2) cos_h 比的是「最近车道 forward」，对向车道按其 forward 同向开 → cos_h=+1；
-        (3) forward 用 speed_norm * cos_h，speed_norm 永远 ≥ 0 → 倒车 cos_h 也可能 ≈ +1。
-
-        v3 修复：
-        (1) lane_keep 改成 penalty：-|lateral_norm| * coef，越偏越扣；
-        (2) 加 off_road penalty（_update_state 里用 project_to_road=False 检测）；
-        (3) 加 wrong_way penalty（Type A: 速度反向；Type B: 跨黄线 lane_id 符号反转）；
-        (4) forward 改用 signed_speed_norm（沿车头方向的速度）→ 倒车自动负分。
+        v3 → v4 改动：
+        (1) lane_keep 从 penalty（-|lat|）改为正向奖励 +coef * (1 - |lat|)：
+            居中 → 正分，贴边 → 0，模型有明确的优化方向。
+        (2) off_road / wrong_way 加入 obs→ 模型能直接看到自己正在被扣分。
+        (3) 每个 step 是一个 RL 决策（无 action_repeat）→ 信用分配精确。
+        (4) ACC 在横向偏差大时主动降速（_compute_acc_control 里处理）。
         """
-        # 主奖励：沿车头方向开多快。倒车 → 负，正常前进 → 正。最大 ±forward_coef。
         forward = self.forward_coef * self.signed_speed_norm
-        # 车道居中：永远 ≤ 0；贴中心 0，贴车道边 -coef
-        lane_keep = -self.lane_keep_penalty_coef * abs(self.lateral_norm)
-        # 越界：脚下不是 Driving lane（人行道 / 草地 / 应急道等）
+        lane_keep = self.lane_keep_coef * (1.0 - abs(self.lateral_norm))
         off_road_p = -self.off_road_penalty if self.off_road else 0.0
-        # 逆行：倒车 / 跨黄线到对向
         wrong_way_p = -self.wrong_way_penalty if self.wrong_way else 0.0
-        # 舒适性：横向加速度二次惩罚（a_y=2 → -0.1；a_y=6 → -0.9）
         lat_acc_n = self.lateral_accel / 2.0
         comfort = -0.1 * (lat_acc_n ** 2)
 
@@ -487,14 +466,12 @@ class CarlaEnv(gym.Env):
 
     def _compute_acc_control(self):
         """
-        ACC 控制器 v2：解决 v1 的 3 个老问题：
-        (1) 平滑区间宽度跟 v_ego 挂钩 → 低速时 1m 距离变化 = 2 m/s v_target 跳变
-            修复：直接用固定的 [d_min, lidar_far] = [5, 28] 这段 23m 做线性插值，
-                  1m 距离变化只引起 0.43 m/s v_target 变化。
-        (2) 油门/刹车硬切换（speed_err 过零就翻转）→ 零附近反复抖
-            修复：deadband = 0.5 m/s，|speed_err| 小于这个就既不油门也不刹车（coast）。
-        (3) lidar 自身瞬时抖动直接灌进 v_target → 控制曲线锯齿
-            修复：v_target 一阶低通滤波，平滑系数 alpha=0.3。
+        ACC 控制器 v3：v2 基础上新增横向偏差降速。
+
+        v2 → v3 改动：
+        (4) 横向偏差大时降低目标速度 → 给 RL 更多反应时间，避免高速冲进对向车道。
+            lateral_norm ∈ [0,1]：0=居中 1=贴边/越界。
+            当 |lat| > 0.5（半条车道宽）开始线性降速，|lat|=1 时 v_target 折半。
         """
         v_ego = float(self.speed)
         d_lead = float(self.lidar_distance)
@@ -507,6 +484,14 @@ class CarlaEnv(gym.Env):
             denom = max(self.acc_lidar_far - self.acc_d_min, 1e-3)
             ratio = (d_lead - self.acc_d_min) / denom
             v_target_raw = self.acc_v_set * float(np.clip(ratio, 0.0, 1.0))
+
+        # 横向偏差大 → 降速：|lat| > 0.5 开始线性衰减，|lat|=1 时 v_target 折半
+        abs_lat = abs(self.lateral_norm)
+        if abs_lat > 0.5:
+            lat_scale = 1.0 - 0.5 * ((abs_lat - 0.5) / 0.5)
+            v_target_raw *= max(lat_scale, 0.5)
+        if self.off_road or self.wrong_way:
+            v_target_raw *= 0.3
 
         # 一阶低通：吃掉 lidar 抖动；reset 时 _v_target_filt 会被置回 acc_v_set
         self._v_target_filt = (
