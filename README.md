@@ -108,8 +108,27 @@ Another thing i found and fixed that model stucked in local min due to lack of o
 ### V4 stage 4(remove action_repeat)
 
 5.20 Trainning
-先读一下相关的paper
-reading: https://arxiv.org/abs/1609.05140
+Something that i notice for Town02 is all this turn is 90 degree turn, making hard for model to learn in the beginning. I will apply next time in Better Town.
+小范围实验成功，300K Step can follow lane, bad in trunning. I am going to test higher tranning self.lane_keep_coef = 0.5->0.8
+
+
+## 阶段目标达成！
+Svaed to .\models\stage_acc_hybrid_v4_20260520_040630_final.zip
+完成ACC+Brake control+ PPO steering的目标，现在转移到更复杂的Town03中增强model robust.
+
+### Demo
+
+
+
+[V2  ACC+PPO for Steering — YouTube](https://www.youtube.com/watch?v=XdELDMxeIsc)
+![V2 Demo](./carla_ppo/videos/IMG_3450.gif)
+
+5.23
+to do read
+Neuro-Cognitive Reward Modeling for Human-Centered Autonomous Vehicle Control (CVPR 2026)
+AEGIS: Human Attention-based Explainable Guidance for Intelligent Vehicle Systems 
+(CHI 2025) 
+
 
 
 

@@ -5,9 +5,9 @@ from carla_env import CarlaEnv
 # Eval 用一张训练时没见过的地图 + 大量 NPC，测泛化能力
 # Town03：城区 + 环岛 + 多车道路口，spawn point ~150 个，足够塞下 80 辆 NPC
 # 想再换可以试 Town05（路口超多）或 Town04（带高速）
-EVAL_MAP = "Town02"
+EVAL_MAP = "Town03"
 EVAL_NPCS = 80
-MODEL_PATH = r".\models\stage_acc_hybrid_v3_20260507_211743_final.zip"
+MODEL_PATH = r".\models\stage_acc_hybrid_v4_3_20260520_091918_final.zip"
 
 env = CarlaEnv(
     map_name=EVAL_MAP,
@@ -28,7 +28,7 @@ ep_steps = 0
 collisions = 0
 
 try:
-    for i in range(500):
+    for i in range(10000):
         action, _ = model.predict(obs, deterministic=True)
         obs, reward, terminated, truncated, info = env.step(action)
         ep_reward += reward

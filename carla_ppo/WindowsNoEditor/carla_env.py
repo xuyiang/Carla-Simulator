@@ -18,16 +18,23 @@ class CarlaEnv(gym.Env):
         debug_lidar: bool = False,
         lidar_vis_fps: float = 20.0,           # 和 LiDAR rotation_frequency 对齐，最丝滑
         lidar_vis_max_points: int = 30000,     # 600k pts/s ÷ 20Hz = 30k/帧，全显示
-        num_npcs: int = 12,
-        map_name: str = "Town02",
+        num_npcs: int = 50,
+        map_name: str = "Town03",
     ):
         self.client = carla.Client("localhost", 2000)
         self.client.set_timeout(20.0)
         # 训练默认 Town02，eval 时可以换成 Town03 / Town05 等更大、布局更不同的地图，测泛化
         self.map_name = map_name
         self.world = self.client.load_world(map_name)
-        # Traffic Manager 用来给 NPC 跑 autopilot；端口默认 8000
+        # 同步模式 + 固定时间步长：用 world.tick() 替代 time.sleep()，
+        # 消除盲等、物理不确定性和传感器时序不一致问题
+        settings = self.world.get_settings()
+        settings.synchronous_mode = True
+        settings.fixed_delta_seconds = 0.05   # 每 tick 精确推进 50ms 物理
+        self.world.apply_settings(settings)
+        # Traffic Manager 在同步模式下也需要设为同步，否则 NPC 不往前走
         self.tm = self.client.get_trafficmanager()
+        self.tm.set_synchronous_mode(True)
         self.tm.set_global_distance_to_leading_vehicle(2.5)
         self.tm.global_percentage_speed_difference(20.0)  # NPC 比限速慢 20%，更易于 ego 学避让
         self.num_npcs = int(num_npcs)
@@ -69,7 +76,7 @@ class CarlaEnv(gym.Env):
         self.forward_coef = 0.7
         # lane_keep 正向奖励：完美居中拿 +lane_keep_coef，贴边衰减到 0
         #        越界由 off_road penalty / 终止单独处理，lane_keep 不再叠惩罚
-        self.lane_keep_coef = 0.5
+        self.lane_keep_coef = 0.8
         # 在非 Driving 车道（人行道/草地等）每个 inner step 持续扣
         self.off_road_penalty = 1.0
         # 逆行（倒车 or 跨黄线到对向车道）惩罚比 off_road 更狠
@@ -212,7 +219,12 @@ class CarlaEnv(gym.Env):
         self.collision_happened = False 
         self.collision_sensor.listen(lambda event: setattr(self,'collision_happened', True))
 
-        time.sleep(1.0)
+        # 同步模式下 TM 也设为同步，确保 NPC 在每个 tick 内推进
+        self.tm.set_synchronous_mode(True)
+
+        # 用 20 个 tick 替代 time.sleep(1.0)：让传感器缓冲区填满 + ego/NPC 稳定下来
+        for _ in range(20):
+            self.world.tick()
         self.step_count = 0
         self._prev_steer = 0.0
         # ACC 低通滤波器在每个 episode 开头重置回巡航速度，避免上 episode 的余值灌进来
@@ -265,7 +277,9 @@ class CarlaEnv(gym.Env):
         )
         self.vehicle.apply_control(control)
 
-        time.sleep(0.05)
+        # 同步模式：world.tick() 等待 server 完成一个 fixed_delta_seconds 的物理步进
+        # tick() 阻塞直到 server 返回，此时所有传感器的回调数据已是最新值
+        self.world.tick()
         self.step_count += 1
         self._update_state()
         self._update_spectator()
@@ -305,6 +319,13 @@ class CarlaEnv(gym.Env):
         return obs, reward, terminated, truncated, info
 
     def close(self):
+        # 退出前恢复异步模式，避免下次加载地图时 sync setting 残留
+        try:
+            settings = self.world.get_settings()
+            settings.synchronous_mode = False
+            self.world.apply_settings(settings)
+        except Exception:
+            pass
         if self.camera is not None:
             self.camera.stop()
             self.camera.destroy()
