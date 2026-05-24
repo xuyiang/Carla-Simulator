@@ -218,8 +218,9 @@ __marimo__/
 .streamlit/secrets.toml
 
 # --- CARLA packaged build: carla_ppo/WindowsNoEditor ---
-# Ignore the shipped simulator tree; keep models/, logs/, PythonAPI/, and *.py at this folder's root.
-# (Explicit Carla folders/exe listed for clarity; bulk of content is covered by the first rule.)
+# Ignore the shipped simulator tree; keep models/*_final.zip, logs/, PythonAPI/, and *.py at this folder's root.
+
+# Block the entire WindowsNoEditor directory first
 carla_ppo/WindowsNoEditor/*
 carla_ppo/WindowsNoEditor/CarlaUE4/
 carla_ppo/WindowsNoEditor/CarlaUE4.exe
@@ -228,8 +229,16 @@ carla_ppo/WindowsNoEditor/Engine/
 carla_ppo/WindowsNoEditor/HDMaps/
 carla_ppo/WindowsNoEditor/Plugins/
 carla_ppo/WindowsNoEditor/__pycache__/
+
+# Allow only the models/ directory so git can enter it
 !carla_ppo/WindowsNoEditor/models/
-!carla_ppo/WindowsNoEditor/models/**
+
+# Then ignore everything inside models/ ...
+carla_ppo/WindowsNoEditor/models/**
+# ... except final model zips at the top level only
+!carla_ppo/WindowsNoEditor/models/*_final.zip
+
+# Allow logs/, PythonAPI/, and *.py scripts
 !carla_ppo/WindowsNoEditor/logs/
 !carla_ppo/WindowsNoEditor/logs/**
 !carla_ppo/WindowsNoEditor/PythonAPI/
