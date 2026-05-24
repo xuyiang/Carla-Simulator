@@ -7,7 +7,7 @@ from carla_env import CarlaEnv
 # 想再换可以试 Town05（路口超多）或 Town04（带高速）
 EVAL_MAP = "Town03"
 EVAL_NPCS = 80
-MODEL_PATH = r".\models\stage_acc_hybrid_v4_3_20260520_091918_final.zip"
+MODEL_PATH = r".\models\stage_acc_hybrid_v5_20260523_223307_final.zip"
 
 env = CarlaEnv(
     map_name=EVAL_MAP,
