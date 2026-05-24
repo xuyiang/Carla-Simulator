@@ -119,15 +119,8 @@ The model is satisfied with driving forward along the path direction — even on
 - Model got stuck in a local minimum due to **lack of off-road / wrong-way observations** — from the model's perspective, the penalty looked like a "black box" with no causal signal.
 - I believe action repeat in CARLA has an optimal methodology dependent on vehicle speed, but the hyperparameter should differ from other RL approaches.
 
-#### Demo
 
-[V2 ACC+PPO for Steering — YouTube](https://www.youtube.com/watch?v=XdELDMxeIsc)
-
-![V2 Demo](./carla_ppo/videos/IMG_3450.gif)
-
----
-
-### V4 — Remove Action Repeat + Synchronous Mode
+### V3 — Remove Action Repeat + Synchronous Mode
 
 > This is the **most impactful architectural change** across all versions.
 
@@ -214,6 +207,14 @@ With `fixed_delta_seconds = 0.05`, each `world.tick()` advances exactly one 50ms
 - Still weak at 90° turns (Town02's typical intersection geometry).
 - Final model saved: `models/stage_acc_hybrid_v4_20260520_040630_final.zip`
 - **Mission accomplished:** ACC brake control + PPO steering is working. Moving to Town03 for robustness testing.
+
+#### Demo
+
+[V3 ACC+PPO for Steering — YouTube](https://www.youtube.com/watch?v=XdELDMxeIsc)
+
+![V3 Demo](./carla_ppo/videos/IMG_3450.gif)
+
+---
 
 #### Next Steps
 
